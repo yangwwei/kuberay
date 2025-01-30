@@ -70,7 +70,7 @@ func main() {
 
 type RegisterHttpHandlerFromEndpoint func(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) error
 
-func startRpcServer(resourceManager *manager.ResourceManager) {
+func startRpcServer(resourceManager manager.ResourceManagerInterface) {
 	klog.Info("Starting gRPC server")
 
 	listener, err := net.Listen("tcp", *rpcPortFlag)

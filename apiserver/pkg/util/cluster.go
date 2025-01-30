@@ -35,7 +35,12 @@ func NewRayCluster(apiCluster *api.Cluster, computeTemplateMap map[string]*api.C
 		return nil, err
 	}
 	// Build cluster
+	// apple batch requires Kind and API Version are set in the metadata
 	rayCluster := &rayv1api.RayCluster{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "RayCluster",
+			APIVersion: "ray.io/v1",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        apiCluster.Name,
 			Namespace:   apiCluster.Namespace,

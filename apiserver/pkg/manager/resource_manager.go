@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/ray-project/kuberay/apiserver/pkg/apis/generated/go/workloadmanager"
 	"github.com/ray-project/kuberay/apiserver/pkg/model"
 	"github.com/ray-project/kuberay/apiserver/pkg/util"
 	api "github.com/ray-project/kuberay/proto/go_client"
@@ -12,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	clientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"sigs.k8s.io/yaml"
 
 	rayv1api "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	rayv1 "github.com/ray-project/kuberay/ray-operator/pkg/client/clientset/versioned/typed/ray/v1"
@@ -37,23 +39,38 @@ type ResourceManagerInterface interface {
 	ListAllJobs(ctx context.Context) ([]*rayv1api.RayJob, error)
 	DeleteJob(ctx context.Context, jobName string, namespace string) error
 	CreateService(ctx context.Context, apiService *api.RayService) (*rayv1api.RayService, error)
-	UpdateRayService(ctx context.Context, request *api.UpdateRayServiceRequest) (*rayv1api.RayService, error)
-	GetService(ctx context.Context, serviceName, namespace string) error
+	UpdateRayService(ctx context.Context, apiService *api.RayService) (*rayv1api.RayService, error)
+	GetService(ctx context.Context, serviceName, namespace string) (*rayv1api.RayService, error)
 	ListServices(ctx context.Context, namespace string) ([]*rayv1api.RayService, error)
 	ListAllServices(ctx context.Context) ([]*rayv1api.RayService, error)
 	DeleteService(ctx context.Context, serviceName, namespace string) error
 	GetClusterEvents(ctx context.Context, clusterName string, namespace string) ([]corev1.Event, error)
 	GetServiceEvents(ctx context.Context, service rayv1api.RayService) ([]corev1.Event, error)
+	ListAllComputeTemplates(ctx context.Context) ([]*corev1.ConfigMap, error)
 }
 
 type ResourceManager struct {
-	clientManager ClientManagerInterface
+	clientManager    ClientManagerInterface
+	appleBatchClient *AppleBatchClient
+	cache            map[string]*WorkloadInfo
+}
+
+type WorkloadInfo struct {
+	workloadID   string
+	workloadName string
+	queue        string
 }
 
 // It would be easier to discover methods.
-func NewResourceManager(clientManager ClientManagerInterface) *ResourceManager {
+func NewResourceManager(clientManager ClientManagerInterface) ResourceManagerInterface {
+	abClient, err := NewAppleBatchClient("localhost:9666")
+	if err != nil {
+		panic("unable to init ab client")
+	}
 	return &ResourceManager{
-		clientManager: clientManager,
+		clientManager:    clientManager,
+		appleBatchClient: abClient,
+		cache:            make(map[string]*WorkloadInfo),
 	}
 }
 
@@ -85,11 +102,19 @@ func (r *ResourceManager) getKubernetesNamespaceClient() clientv1.NamespaceInter
 // clusters
 func (r *ResourceManager) CreateCluster(ctx context.Context, apiCluster *api.Cluster) (*rayv1api.RayCluster, error) {
 	// populate cluster map
-	computeTemplateDict, err := r.populateComputeTemplate(ctx, apiCluster.ClusterSpec, apiCluster.Namespace)
-	if err != nil {
-		return nil, util.NewInternalServerError(err, "Failed to populate compute template for (%s/%s)", apiCluster.Namespace, apiCluster.Name)
-	}
+	// computeTemplateDict, err := r.populateComputeTemplate(ctx, apiCluster.ClusterSpec, apiCluster.Namespace)
+	//if err != nil {
+	//	return nil, util.NewInternalServerError(err, "Failed to populate compute template for (%s/%s)", apiCluster.Namespace, apiCluster.Name)
+	//}
 
+	// Create a default compute template
+	// TODO: how to support this?
+	computeTemplateDict := map[string]*api.ComputeTemplate{}
+	computeTemplateDict["default-template"] = &api.ComputeTemplate{
+		Name:      "default-template",
+		Namespace: "default",
+		Cpu:       1,
+	}
 	// convert *api.Cluster to rayv1api.RayCluster
 	rayCluster, err := util.NewRayCluster(apiCluster, computeTemplateDict)
 	if err != nil {
@@ -100,12 +125,38 @@ func (r *ResourceManager) CreateCluster(ctx context.Context, apiCluster *api.Clu
 	clusterAt := r.clientManager.Time().Now().String()
 	rayCluster.Annotations["ray.io/creation-timestamp"] = clusterAt
 
-	newRayCluster, err := r.getRayClusterClient(apiCluster.Namespace).Create(ctx, rayCluster.Get(), metav1.CreateOptions{})
+	yamlBytes, err := yaml.Marshal(rayCluster)
 	if err != nil {
-		return nil, util.NewInternalServerError(err, "Failed to create a cluster for (%s/%s)", rayCluster.Namespace, rayCluster.Name)
+		return nil, util.NewInternalServerError(
+			err, "Failed to parse the RayCluster spec (%s/%s)",
+			rayCluster.Namespace, rayCluster.Name)
 	}
 
-	return newRayCluster, nil
+	defaultQueue := "root.a"
+	response, err := r.appleBatchClient.Submit(ctx, &workloadmanager.WorkloadSpec{
+		Queue:              defaultQueue,
+		WorkloadName:       rayCluster.Name,
+		WorkloadDefinition: yamlBytes,
+	})
+	if err != nil {
+		return nil, util.NewInternalServerError(
+			err, "Failed to submit RayCluster spec to apple-batch (%s/%s)",
+			rayCluster.Namespace, rayCluster.Name)
+	}
+
+	fmt.Sprintln(response.WorkloadId, response.WorkloadName, defaultQueue)
+	r.cache[response.WorkloadId] = &WorkloadInfo{
+		workloadID:   response.WorkloadId,
+		workloadName: response.WorkloadName,
+		queue:        defaultQueue,
+	}
+
+	//newRayCluster, err := r.getRayClusterClient(apiCluster.Namespace).Create(ctx, rayCluster.Get(), metav1.CreateOptions{})
+	//if err != nil {
+	//	return nil, util.NewInternalServerError(err, "Failed to create a cluster for (%s/%s)", rayCluster.Namespace, rayCluster.Name)
+	//}
+
+	return rayCluster.RayCluster, nil
 }
 
 // Compute template
@@ -137,8 +188,32 @@ func (r *ResourceManager) populateComputeTemplate(ctx context.Context, clusterSp
 }
 
 func (r *ResourceManager) GetCluster(ctx context.Context, clusterName string, namespace string) (*rayv1api.RayCluster, error) {
-	client := r.getRayClusterClient(namespace)
-	return getClusterByName(ctx, client, clusterName)
+	for k, v := range r.cache {
+		if v.workloadName == clusterName && v.queue == fmt.Sprintf("root.%s", namespace) {
+			response, err := r.appleBatchClient.Describe(ctx, &workloadmanager.DescribeWorkloadRequest{
+				WorkloadId: k,
+			})
+			if err != nil {
+				return nil, util.NewInternalServerError(
+					err, "Failed to find the RayCluster from apple-batch (%s/%s)",
+					clusterName, namespace)
+			}
+
+			rayCluster := &rayv1api.RayCluster{}
+			err = yaml.Unmarshal(response.WorkloadDefinition, rayCluster)
+			if err != nil {
+				return nil, util.NewInternalServerError(
+					err, "Failed to unmarshal RayCluster from apple-batch describe response (%s/%s)",
+					clusterName, namespace)
+			}
+
+			return rayCluster, nil
+		}
+	}
+
+	return nil, util.NewInternalServerError(
+		fmt.Errorf("ray cluster not found"), "Failed to find a mapping from the given cluster name (%s/%s)",
+		clusterName, namespace)
 }
 
 func (r *ResourceManager) ListClusters(ctx context.Context, namespace string) ([]*rayv1api.RayCluster, error) {
